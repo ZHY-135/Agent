@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 说明：核心路径零依赖，因此 CI 里**不安装任何第三方包**就能跑完所有冒烟步骤。
+# 这也是本项目的一条设计约束：装不上包的环境下，回归依然可跑。
+env:
+  PYTHONIOENCODING: utf-8          # 中文日志在 Windows/Linux 下都要能正常输出
+  PYTHONUTF8: "1"
+
+jobs:
+  smoke:
+    name: 冒烟（Python ${{ matrix.python-version }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false             # 一个平台失败不应掩盖其他平台的结果
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+        include:
+          # Windows 也要覆盖：编码（GBK 控制台）与路径分隔符问题只在 Windows 暴露，
+          # 而本项目正是在 Windows 上发现了"相对路径导致索引同步静默失效"的缺陷。
+          - os: windows-latest
+            python-version: "3.11"
+    defaults:
+      run:
+        # 项目根即仓库根（pyproject.toml 所在层），包是同级的 RAG/ 子目录。
+        # `python -m RAG.xxx` 需要项目根在 sys.path 上，因此所有命令都在这里执行。
+        working-directory: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 显示环境信息
+        run: python -c "import sys, platform; print(sys.version); print(platform.platform())"
+
+      - name: 压测（上下文预算硬约束 + top_k 截断）
+        run: python -m RAG.stress_test
+
+      - name: CLI 冒烟 —— 检索链路
+        # 语料目录不存在时 main.py 会自动生成一份演示语料，因此这一步零依赖可跑
+        run: python -m RAG.main demo docs --verbose
+
+      - name: CLI 冒烟 —— 生成链路（引用校验 + 拒答）
+        run: python -m RAG.main qa "error code 0x80070005" --top-k 3 --docs docs
+
+      - name: 冒烟失败时输出诊断
+        if: failure()
+        run: |
+          echo "::group::环境信息"
+          python -c "import sys; print(sys.version); print(sys.path)"
+          echo "::endgroup::"
+
+  lint:
+    name: 静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 安装静态检查工具
+        run: pip install "ruff>=0.5" "mypy>=1.8"
+      # 这两步现在是**硬门禁**：仓库当前 ruff 0 告警、mypy 0 错误，
+      # 所以让它们真正阻断 CI（"常年红灯的 CI 等于没有 CI"，但没有红灯才有意义）。
+      - name: ruff（未用导入 / 未定义名字 / 导入顺序）
+        run: ruff check .
+      - name: mypy（按 pyproject 的 files=["RAG"] 检查包内代码）
+        run: mypy
+
+  install:
+    name: 可安装性（pip install -e .）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 可编辑安装（验证 pyproject.toml 与 README 声明都正确）
+        run: pip install -e .
+      - name: 控制台脚本可用
+        run: rag --help

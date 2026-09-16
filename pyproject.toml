@@ -1,0 +1,96 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-min"
+version = "0.1.0"
+description = "最小可运行、可评测的检索增强生成（RAG）流水线：父子块切分、混合检索、引用回填校验与拒答"
+readme = "README.md"
+requires-python = ">=3.10"
+# SPDX 表达式（PEP 639）。旧写法 license = { text = "MIT" } 已被 setuptools 标记废弃，
+# 且会连带要求移除 License :: 分类器——uv build 时会直接抛出弃用警告。
+license = "MIT"
+keywords = ["rag", "retrieval", "vector-search", "pgvector", "bm25", "evaluation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# 核心路径**零依赖**：demo / qa / eval / 测试 全部只用标准库。
+# 这也是一条设计约束——CI 里不需要装任何东西就能跑回归。
+dependencies = []
+
+[project.optional-dependencies]
+openai   = ["openai>=1.0"]
+pgvector = ["psycopg2-binary>=2.9", "pgvector>=0.2", "numpy>=1.24"]
+loaders  = ["beautifulsoup4>=4.12"]          # HTML 解析（当前为正则退化实现）
+dotenv   = ["python-dotenv>=1.0"]
+# 可视化观测台（python -m RAG.main serve）。
+# 刻意做成**可选**分组：核心路径（demo/qa/eval/测试）依然零依赖，
+# 没装 streamlit 的人也能跑通全部功能，只是看不到图形界面。
+webui    = ["streamlit>=1.30"]
+# debugpy：VS Code 按 F5 调试必需（Python 扩展也可自动装，但登记在 dev 里更明确）。
+# ⚠ 它必须在**某个分组**里：`uv sync` 会让环境精确匹配 lock+extra，
+#   用 `uv pip install debugpy` 装的包下一次 sync 就会被删掉（实测过一次）。
+dev      = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.5", "mypy>=1.8", "debugpy>=1.8"]
+
+[project.scripts]
+rag = "RAG.main:main"
+
+[project.urls]
+Homepage = "https://github.com/ZHY-135/Agent"
+
+[tool.setuptools]
+# 项目根 = 本目录，Python 包 = 同级的 RAG/ 子目录。
+# 目录名与包名同名（项目叫 RAG、包也叫 RAG）是刻意保留的：项目作者希望
+# "项目文件夹就是 RAG"，因此这里显式声明包位置，不依赖自动发现
+# （自动发现面对"根目录与包同名"时容易判断错）。
+packages = ["RAG"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [
+    ".git", "__pycache__", "build", "dist", ".pytest_tmp", ".venv", ".uv-cache",
+    # 设计文档 notebook：里面的代码块是"教学展板"而不是产品代码，
+    # 刻意写得紧凑（一行里写 `lo, hi = …; span = …`）以便一屏看全。
+    # 对它套用生产级 lint 规则只会得到一堆无意义告警，
+    # 而"常年有告警的 lint"等价于没有 lint——所以整篇排除。
+    "*.ipynb",
+]
+
+[tool.ruff.lint]
+# 起步只开"能抓真问题"的规则：未用导入/未定义名字/导入顺序。
+# 不追求风格统一，避免因大量格式告警让 CI 常年红灯（红灯的 CI 等于没有 CI）。
+select = ["E", "F", "I"]
+ignore = [
+    "E501",   # 行长：中文注释按字符数算会频繁超限，交给 formatter 处理
+    "E402",   # 模块级导入不在文件开头：脚本为设置 sys.path 必须先导入 sys
+    "E731",   # lambda 赋值：本仓库仅用于极短的局部辅助
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试文件里刻意保留未使用的导入（pytest shim / fixture 兼容层）
+"tests/*" = ["F401"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = false
+# 渐进式收紧：先只检查已注解的函数体，不要求全量注解
+check_untyped_defs = true
+# files 指向**包目录**（项目 root/RAG/）；exclude 指同级的 tests/
+files = ["RAG"]
+exclude = ["tests/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 测试通过 `python -m tests.run_tests` 统一入口运行
+# （零依赖运行器 + pytest 兼容垫片，见 tests/run_tests.py 的说明）。
+# 用真实 pytest 时下列配置生效：
+addopts = "-q"

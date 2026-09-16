@@ -1,0 +1,78 @@
+# ⚠️ 注意：git 的 .gitignore **不支持行尾注释**。
+#    `路径/  # 说明` 会被当成"一整条模式"，永远不可能匹配到任何文件——
+#    本文件历史上就踩过这个坑（`.uv-cache/`、`.pytest_tmp/` 等 5 条规则
+#    因此长期静默失效）。所以本文件的说明一律写在**上一行**。
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---- 虚拟环境与包管理器 ----
+.venv/
+venv/
+env/
+# uv 缓存（受限环境需把它重定向到工作区内）
+.uv-cache/
+.uv/
+
+# ---- 测试与工具缓存 ----
+.pytest_cache/
+# tests/run_tests.py 与 stress_test.py 的临时工作目录
+.pytest_tmp/
+# pytest --basetemp 指向工作区内时的产物
+.pytest_*/
+# pytest 清理失败的孤儿目录（受限环境里会残留）
+pytest-cache-files-*/
+# RAG_TEST_TMPDIR 指向工作区内时的产物
+.t_run/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 密钥与本地配置（切勿提交）----
+.env
+.env.local
+*.local
+
+# ---- 编辑器 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# ---- 提交信息临时文件（git commit -F 用）----
+_commitmsg.txt
+_cmsg.txt
+
+# ---- 观测台的本地设置（语料目录 / 收藏 / 界面开关）----
+# 属于本机个人偏好，不是项目资产：换台机器应当从默认值开始
+rag.local.json
+
+# ---- 本地语料（离线实验用，不入库）----
+# 若你把个人文档/代码放进来做评测语料，取消下面这行注释
+# local_docs/
+
+# ---- 仅本地保留，不随仓库发布 ----
+# 仓库只发布"可运行的 demo 本体"：代码 + 根 README + 打包/依赖/许可证。
+# 下面这些留在本机，方便继续开发与本地回归，但不进公开仓库。
+# 它们从未被提交过，所以这里的作用是"阻止以后误提交"；
+# 哪天想发布了，删掉对应的行即可（或用 git add -f <路径> 强制加入）。
+#
+# 分层组织的单元测试
+tests/
+# 内部文档与设计 notebook（demo 的示例语料也在这里）
+docs/
+# 评测集样例
+eval/
+# 评测集起草器等辅助脚本
+scripts/
+# 内部路线图与 TODO
+项目后续改进方案.md
