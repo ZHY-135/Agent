@@ -6,14 +6,12 @@
 > 核心路径**零第三方依赖**：不装任何包也能跑通 `demo` / `qa` 与观测台之外的完整链路。
 
 <!--
-  📸 GitHub 展示建议 1：观测台截图。把截图存成 images/observatory.png（仓库根新建 images/ 目录），
-     然后去掉下面这行的注释——带可视化的项目，一张截图比十行文字有用。
-![观测台截图](images/observatory.png)
-
-  🏅 GitHub 展示建议 2：CI 徽章（地址已填好）。**等第一次 push 且 CI 跑完后**再取消注释——
-     在此之前该图片还是 404，GitHub 上会显示成破图。
+  🏅 CI 徽章：地址已填好，但请**等第一次 push 且 CI 跑完（变绿）之后**再取消下面这行的注释——
+     在此之前该地址还是 404，GitHub 上会显示成破图。
 ![CI](https://github.com/ZHY-135/Agent/actions/workflows/ci.yml/badge.svg)
 -->
+
+![观测台截图](images/observatory.png)
 
 ---
 
