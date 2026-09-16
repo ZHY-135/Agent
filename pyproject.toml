@@ -28,8 +28,19 @@ dependencies = []
 [project.optional-dependencies]
 openai   = ["openai>=1.0"]
 pgvector = ["psycopg2-binary>=2.9", "pgvector>=0.2", "numpy>=1.24"]
-loaders  = ["beautifulsoup4>=4.12"]          # HTML 解析（当前为正则退化实现）
+# 文档解析的可选依赖。**两个包都必须列全**：converters.INSTALL_HINT 让用户执行
+# `pip install "rag-min[loaders]"` 来解决"格式读不了"，所以这个 extra 里必须有
+# 对应转换器真正需要的包——否则用户照做一遍，问题一模一样。
+# · beautifulsoup4：HTML 结构化。缺它时 HTML 会**降级**（仍可索引，只是丢标题层级）。
+# · python-docx：DOCX 解析。缺它时 .docx 会被跳过（并在日志/台账里说明原因）。
+loaders  = ["beautifulsoup4>=4.12", "python-docx>=1.1"]
 dotenv   = ["python-dotenv>=1.0"]
+# 本机语义向量（RAG_EMBEDDING_PROVIDER=local）：**无需 API Key** 的真实语义检索。
+# 选 fastembed 而不是 sentence-transformers 的原因：前者基于 ONNX Runtime（几十 MB），
+# 后者会拖进 PyTorch（GB 级）——而本 extra 的定位是"让 clone 下来的人能低成本试一下真模型"，
+# 装个 GB 级依赖才能用，等于没提供这个选项。
+# ⚠ 首次使用会**联网下载模型权重**；离线环境请继续用默认的 hash（零依赖、可跑通全链路）。
+local    = ["fastembed>=0.3"]
 # 可视化观测台（python -m RAG.main serve）。
 # 刻意做成**可选**分组：核心路径（demo/qa/eval/测试）依然零依赖，
 # 没装 streamlit 的人也能跑通全部功能，只是看不到图形界面。

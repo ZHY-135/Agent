@@ -16,7 +16,8 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from .embedders import CachingEmbedder, HashEmbedder, OpenAIEmbedder
+from .converters import REASON_HINT
+from .embedders import CachingEmbedder, HashEmbedder, LocalEmbedder, OpenAIEmbedder
 from .evaluation import (
     ABLATIONS,
     check_anchors,
@@ -54,6 +55,14 @@ def connect():
 def build_embedder(settings: Settings):
     if settings.embedding_provider == "hash":
         return CachingEmbedder(HashEmbedder(settings.embedding_dim))
+    if settings.embedding_provider == "local":
+        # ⚠ 这里**刻意不做依赖探测**：LocalEmbedder 懒加载模型，缺 fastembed 或权重
+        #   下载失败都会在首次 embed 时抛出带修复指引的错误（见 _ensure_model）。
+        #   若在这里 import fastembed 来"提前检查"，`rag --help`、`rag init-db`
+        #   这类根本不需要嵌入的命令也会被牵连——而它们本该零依赖可用。
+        return CachingEmbedder(
+            LocalEmbedder(settings.local_model, settings.embedding_dim,
+                          cache_dir=settings.local_cache_dir))
     if not settings.openai_api_key:
         raise ValueError("使用 OpenAI embedding 时必须设置 OPENAI_API_KEY")
     try:
@@ -98,6 +107,36 @@ def build_generator(provider: str, settings: Settings, model: Optional[str] = No
 def build_pipeline(settings: Settings, generator: Optional[Generator] = None) -> RAGPipeline:
     return RAGPipeline(build_embedder(settings), build_store(settings),
                        use_bm25=True, use_mmr=True, generator=generator)
+
+
+def format_index_summary(stat: dict) -> str:
+    """把 `index()` 的统计渲染成给用户看的多行文本。
+
+    抽成函数是为了让 demo / index / qa 三个入口**说同样的话**。
+    若三处各写一遍，迟早会出现"某个入口忘了报告被跳过的文件"——
+    而那恰恰是最需要被看见的信息（"我放了文件却什么都没发生"）。
+    """
+    lines = [f"索引完成：父块 {stat['parents']}，子块 {stat['children']}，"
+             f"跳过 {stat['skipped']}，删除 {stat['deleted']}"]
+    if stat.get("empty"):
+        lines.append(f"  切不出内容的文件 {stat['empty']} 个"
+                     f"（已登记指纹，不会每次重读）")
+    if stat.get("unsupported"):
+        by_reason = stat.get("unsupported_reasons") or {}
+        detail = "；".join(f"{count} 个：{REASON_HINT.get(reason, reason)}"
+                          for reason, count in sorted(by_reason.items()))
+        lines.append(f"  ⚠ 有 {stat['unsupported']} 个文件**未进入索引**：{detail}")
+        names = stat.get("unsupported_files") or []
+        if names:
+            # 先给"有几个 + 为什么"，再给"是哪些"：前者决定要不要处理，后者决定处理谁
+            shown = "、".join(names[:5])
+            more = f" 等共 {len(names)} 个" if len(names) > 5 else ""
+            lines.append(f"    涉及文件：{shown}{more}")
+    if stat.get("degraded"):
+        names = "、".join((stat.get("degraded_files") or [])[:5])
+        lines.append(f"  ⚠ 有 {stat['degraded']} 个文件**降级索引**"
+                     f"（内容搜得到，但结构有损）：{names}")
+    return "\n".join(lines)
 
 
 def ensure_demo_document(docs_dir: Path) -> None:
@@ -153,6 +192,35 @@ def print_answer(result: dict) -> None:
           f"，非法 {check['invalid_refs'] or '无'}"
           f"，未被引用 {check['unused_refs'] or '无'}"
           f"，覆盖率 {check['coverage'] * 100:.0f}%")
+
+
+def run_chat(pipeline: RAGPipeline, args) -> None:
+    """`qa --chat`：交互式多轮问答。
+
+    ⚠ **本轮（4A）只做"拼历史 + 扣预算"，不做查询改写**，所以开场就把边界说清楚：
+      纯指代（"它呢？"）检索不到东西——因为拿去检索的是原始问句，
+      里面没有可检索的实词。用户在第一次使用时就该知道这一点，
+      而不是问了三轮才发现"怎么越问越不准"。
+    """
+    print("多轮模式（输入问题回车提交，输入 :q 退出）")
+    print("提示：当前**不做查询改写**，请把问题问完整；纯指代（如“它呢？”）可能检索不到。")
+    turns: list = []
+    while True:
+        try:
+            question = input("\n问> ").strip()
+        except (EOFError, KeyboardInterrupt):           # Ctrl+C / 管道结束：正常退出
+            print()
+            break
+        if not question:
+            continue
+        if question in {":q", ":quit", "exit", "quit"}:
+            break
+        result = pipeline.answer(question, top_k=args.top_k, history=turns)
+        print_answer(result)
+        # 只把**答案正文**存进历史：拒答也照样入库，否则下一轮会以为没问过。
+        # 注意不要把 prompt 或引用清单存进去——它们会迅速吃光历史预算。
+        turns.append({"question": question, "answer": result["answer"]["text"]})
+    print(f"已退出多轮模式（共 {len(turns)} 轮）。")
 
 
 def run_eval(pipeline: RAGPipeline, args, parser) -> None:
@@ -320,6 +388,9 @@ def main() -> None:
     parser.add_argument("--out", default=None, help="eval：报告输出路径")
     parser.add_argument("--provider", choices=["echo", "openai"], default=None,
                         help="生成器：qa 默认 echo（离线）；demo 默认不生成")
+    parser.add_argument("--chat", action="store_true",
+                        help="qa：多轮交互模式（把历史拼进 prompt 并扣预算；"
+                             "**不做查询改写**，纯指代可能检索不到）")
     parser.add_argument("--model", default=None, help="生成模型名（--provider openai 时生效）")
     parser.add_argument("--port", type=int, default=8501, help="serve：观测台端口")
     parser.add_argument("--no-browser", action="store_true",
@@ -362,7 +433,7 @@ def main() -> None:
         docs_dir = Path(args.value or "./docs")
         ensure_demo_document(docs_dir)
         stat = pipeline.index(str(docs_dir))
-        print(f"索引完成：父块 {stat['parents']}，子块 {stat['children']}，跳过 {stat['skipped']}")
+        print(format_index_summary(stat))
         for question in ("连接池最大连接数是多少", "error code 0x80070005"):
             result = pipeline.query(question, top_k=3, min_sim=0.0)
             print(f"\n问题：{question}")
@@ -373,11 +444,13 @@ def main() -> None:
         if not args.value:
             parser.error("index 需要文档目录，例如：python -m RAG.main index ./docs")
         stat = pipeline.index(args.value)
-        print(f"索引完成：父块 {stat['parents']}，子块 {stat['children']}，"
-              f"跳过 {stat['skipped']}，删除 {stat['deleted']}")
+        print(format_index_summary(stat))
         return
 
-    if not args.value:
+    # ⚠ `qa --chat` 的问题来自交互输入，不需要位置参数——所以这条校验必须放它之后判断，
+    #   否则 `rag qa --chat` 会在进入多轮模式前就被"缺少问题"拦下（用户看到的是一句
+    #   毫不相干的用法提示，很难联想到是校验顺序的问题）。
+    if not args.value and not (args.command == "qa" and args.chat):
         parser.error(f"{args.command} 需要问题，例如："
                      f"python -m RAG.main {args.command} \"连接池最大连接数是多少\"")
 
@@ -388,8 +461,11 @@ def main() -> None:
             docs_dir = Path(args.docs)
             ensure_demo_document(docs_dir)
             stat = pipeline.index(str(docs_dir))
-            print(f"已建立临时索引：父块 {stat['parents']}，子块 {stat['children']}"
-                  f"（来自 {docs_dir}）")
+            print(f"已建立临时索引（来自 {docs_dir}）：")
+            print(format_index_summary(stat))
+        if args.chat:
+            run_chat(pipeline, args)
+            return
         print(f"\n问题：{args.value}")
         print_answer(pipeline.answer(args.value, top_k=args.top_k))
         return

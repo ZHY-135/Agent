@@ -5,11 +5,7 @@
 >
 > 核心路径**零第三方依赖**：不装任何包也能跑通 `demo` / `qa` 与观测台之外的完整链路。
 
-<!--
-  🏅 CI 徽章：地址已填好，但请**等第一次 push 且 CI 跑完（变绿）之后**再取消下面这行的注释——
-     在此之前该地址还是 404，GitHub 上会显示成破图。
 ![CI](https://github.com/ZHY-135/Agent/actions/workflows/ci.yml/badge.svg)
--->
 
 ![观测台截图](images/observatory.png)
 
@@ -105,24 +101,56 @@ python -m RAG.debug_trace                      # 按 9 个阶段打印中间结�
 ```bash
 python -m RAG.main index  /path/to/你的文档目录
 python -m RAG.main qa "你的问题" --docs /path/to/你的文档目录
+python -m RAG.main qa --chat --docs /path/to/你的文档目录   # 多轮追问（拼历史，不做改写）
 python -m RAG.main serve --docs /path/to/你的文档目录        # 面板里也能随时改
 ```
 
 面板左侧「📁 语料目录」还提供：**系统原生「选择文件夹」对话框**、路径实时校验、常用目录收藏、自动记住上次选择。
 
-支持 `.md` / `.markdown` / `.txt` / `.html` / `.htm`；`.pdf` / `.docx` 已接入扫描与转换接口（需装 `docling` / `python-docx` 后生效）。
+支持格式（下表与代码实际行为一致）：
 
-### 5. 接入真实模型与数据库（可选）
+| 格式 | 状态 |
+|---|---|
+| `.md` / `.markdown` | ✅ 完整支持（本身就是中间表示） |
+| `.txt` | ✅ 完整支持：编码兜底（UTF-8 → GB18030）、标题识别、硬换行段落重排 |
+| `.html` / `.htm` | ✅ **保留标题层级**（`h1`–`h6` → `##`…，代码块加围栏，导航/页脚/脚本被剔除）。未装 `beautifulsoup4` 时自动**降级**为正则去标签——**降级仍会进索引**，只是面包屑退化为文件名 |
+| `.docx` | ✅ 支持：保留标题层级（含中文样式名「标题 1」）、列表，且**表格按文档顺序**插入。需 `python-docx`（`pip install "rag-min[loaders]"`）；未装时会被跳过并在索引汇总与台账里标注原因 |
+| `.pdf` | ❌ **不支持直接索引**（刻意不做，见下文「已知限制」）。会被扫描到、被点名，并给出**离线转换指引**（docling / pymupdf4llm / markitdown 任选其一） |
+| `.doc` | ❌ 不支持（Word 97-2003 二进制格式）。会被扫描到并提示「另存为 .docx」 |
+
+### 5. 用真实语义向量（可选，两种方式）
+
+**方式 A：本机模型，不需要 API Key**（推荐先试这个）
 
 ```bash
-export RAG_EMBEDDING_PROVIDER=openai      # 用真实语义向量（默认是零依赖的伪向量）
+pip install "rag-min[local]"              # fastembed / ONNX，几十 MB（不是 PyTorch）
+export RAG_EMBEDDING_PROVIDER=local
+python -m RAG.main qa "连接池上限是多少" --docs ./你的语料目录
+```
+
+默认模型是 `BAAI/bge-small-zh-v1.5`（512 维，中文小模型）；可用 `RAG_LOCAL_MODEL` 换模型，
+可选清单见 `RAG/config.py` 的 `LOCAL_EMBED_MODELS`。
+⚠ **首次使用会联网下载模型权重**（约 90 MB，之后走本地缓存）；完全离线请继续用默认的伪向量。
+
+> 说明：本项目的检索质量**目前还没有在真实评测集上量化过**（评测集需要人工标注 `reviewed`）。
+> 所以这里只说"能用本机模型做语义检索"，**不声称它比 `openai` 或比 hash 好多少**——
+> 现成的 43 条评测集跑完 recall@k / nDCG 之后，能力对比才有据可依。
+
+**方式 B：OpenAI，需要 API Key**
+
+```bash
+export RAG_EMBEDDING_PROVIDER=openai
 export OPENAI_API_KEY=sk-...
 export RAG_BACKEND=pgvector               # 用 PostgreSQL + pgvector 持久化（默认是内存）
 export DATABASE_URL=postgresql://user:pass@localhost:5432/rag
 python -m RAG.main init-db                # 建表与 HNSW 索引
 ```
 
-> 换嵌入模型后**索引会自动重建**：嵌入器身份已计入"索引签名"，`index()` 会发现签名变化并整篇重算，
+> ⚠ **换嵌入模型后请重新标定 `MIN_SIM` / `REFUSE_MIN_VEC_SCORE`**：这两个阈值（默认 0.35）
+> 是按 `text-embedding-3-small` 的余弦分布标定的，换模型后分布会变——沿用旧阈值可能
+> 表现为"该答的拒答了"或"不该答的放过去了"。
+>
+> ✅ 但**索引会自动重建**：嵌入器身份已计入"索引签名"，`index()` 会发现签名变化并整篇重算，
 > 不需要你手动清库。（详见下文"一致性与可靠性防护"）
 
 ---
@@ -145,7 +173,7 @@ python -m RAG.main init-db                # 建表与 HNSW 索引
 
 ### 嵌入
 - 批量调用（64/批）、指数退避重试、维度校验、按内容哈希缓存
-- 两种实现：`HashEmbedder`（零依赖伪向量，演示与离线用）/ `OpenAIEmbedder`（生产用）
+- 三种实现：`HashEmbedder`（零依赖伪向量，离线演示用）/ `LocalEmbedder`（本机真实语义向量，**免 API Key**）/ `OpenAIEmbedder`（生产用）
 
 ### 存储
 - `VectorStore` 抽象 + 两种实现：`MemoryStore`（内存，演示）/ `PgVectorStore`（PostgreSQL + pgvector）
@@ -246,7 +274,7 @@ main.py（装配：唯一知道"用哪个具体实现"的地方）
 
 | 换什么 | 改哪里 | 现有实现 |
 |---|---|---|
-| 嵌入模型 | `main.build_embedder()` | `HashEmbedder`（离线演示）/ `OpenAIEmbedder` |
+| 嵌入模型 | `main.build_embedder()` | `HashEmbedder`（零依赖伪向量，默认）/ `LocalEmbedder`（本机真实语义向量，免 Key）/ `OpenAIEmbedder`（需 Key） |
 | 向量库 | `main.build_store()` | `MemoryStore`（演示）/ `PgVectorStore`（生产） |
 | LLM | `main.build_generator()` | `EchoGenerator`（离线）/ `OpenAIGenerator` |
 | 切分与检索参数 | `config.py` | 一个文件管全部可调参数 |
@@ -303,16 +331,19 @@ main.py（装配：唯一知道"用哪个具体实现"的地方）
 | `CONTEXT_BUDGET` | 6000 | prompt 的 token 预算 |
 | `REFUSE_MIN_VEC_SCORE` | 0.35 | 支持度低于此值则拒答（与**原始余弦**比较） |
 
-环境变量：`RAG_BACKEND`（memory / pgvector）、`RAG_EMBEDDING_PROVIDER`（hash / openai）、`RAG_EMBED_MODEL`、`DATABASE_URL`、`OPENAI_API_KEY`。
+环境变量：`RAG_BACKEND`（memory / pgvector）、`RAG_EMBEDDING_PROVIDER`（hash / local / openai）、`RAG_EMBED_MODEL`、`RAG_LOCAL_MODEL`、`RAG_EMBED_DIM`、`DATABASE_URL`、`OPENAI_API_KEY`。
 
 ---
 
 ## ⚠️ 已知限制
 
-- **默认是伪向量**（`HashEmbedder`）：只认得字面重合，用于零依赖演示。要真正的语义检索请设 `RAG_EMBEDDING_PROVIDER=openai`。
-- **PDF / Word 转换仍是桩**：已接入扫描与接口，装上 `docling` / `python-docx` 后才真正生效。
-- **HTML 标题层级会丢**：当前用正则去标签（计划替换为 BeautifulSoup）。
-- **不支持多轮追问**：`history_tokens` 只预留了预算位置，没有历史与查询改写。
+- **默认是伪向量**（`HashEmbedder`）：只认得字面重合，用于零依赖演示。要真正的语义检索有两条路：`RAG_EMBEDDING_PROVIDER=local`（**本机模型，免 API Key**，装 `rag-min[local]`）或 `openai`（需 Key）。⚠ **换模型后请重新标定 `MIN_SIM` / `REFUSE_MIN_VEC_SCORE`**——这两个阈值是按 `text-embedding-3-small` 的余弦分布标定的。
+- **`local` 模式首次运行需联网下载模型权重**（bge-small-zh 约 100 MB），之后走本地缓存。完全离线的环境请继续用默认的 hash：它零依赖、能跑通全链路，只是检索质量**仅供回归对比**，不能当效果结论。
+- **PDF 不支持直接索引（刻意不做）**：PDF 只有版式坐标、**没有可靠的语义层级**，而标题正是本项目面包屑与溯源的骨架——公开基准里最好的 docling 标题识别也只有 0.824，而**错误的面包屑比没有面包屑更糟**（会让检索结果张冠李戴）。放进语料目录的 `.pdf` 会被扫描到，并在索引汇总与观测台台账里**点名说明"不参与索引"**，同时给出离线转换指引（docling / pymupdf4llm / markitdown 任选其一，先转 Markdown 再入库）。
+- **`.doc` 不支持**：Word 97-2003 是老二进制格式，没有公开稳定的结构，请先在 Word / WPS 里「另存为」`.docx`。
+- **DOCX 需要 `python-docx`**：`pip install "rag-min[loaders]"`。未装时 `.docx` 会被跳过，并在索引汇总与台账里标注「缺解析依赖」——**不会静默忽略**。
+- **HTML 未装 `beautifulsoup4` 时标题层级会丢**：会自动降级为正则去标签——内容仍然进索引（这一点是刻意的：少层级远好于搜不到），但面包屑退化为文件名。装 `pip install "rag-min[loaders]"` 即可保留结构（详见上文「支持格式」表）。
+- **多轮追问只做"拼历史"，不做查询改写**（`rag qa --chat`，或面板勾选「多轮追问」）：历史会被拼进 prompt 并从资料预算里扣走（上限 `HISTORY_MAX_TOKENS`），且历史段**不带 `[n]` 编号**，以免被引用校验误认为资料。所以**追问里出现上一轮原词时**模型能借助上下文；但**纯指代（"它的默认值呢？"）仍会检索跑偏**——检索用的是原始问句，里面没有可检索的实词。实测这一问的向量支持度为 `0.0000`，只靠少量关键词命中凑出一个引用。真正的解法是先用一次 LLM 调用把追问改写成独立查询（已列入后续计划）。
 - **内存模式不跨进程持久化**：需要持久化请用 `RAG_BACKEND=pgvector`。
 - **BM25 与内存检索是暴力扫描**：适合中小语料；更大规模建议交给数据库全文索引与 pgvector。
 - **本仓库不含测试与评测资产**：`tests/`、`eval/` 等保留在开发机本地，因此 `eval` 子命令需要自备评测集才能使用。

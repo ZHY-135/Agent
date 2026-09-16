@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from .converters import REASON_DEGRADED, REASON_HINT, index_capability
 from .loaders import SUPPORTED, iter_documents
 
 # 状态文件放项目根：与启动目录无关（用 __file__ 定位），便于"这个项目的偏好归这个项目管"
@@ -42,6 +43,18 @@ def default_state_path() -> Path:
 def supported_suffixes_text() -> str:
     """给用户看的受支持后缀清单（从 loaders.SUPPORTED 生成，避免两处维护）。"""
     return "、".join(sorted(SUPPORTED))
+
+
+def unsupported_text(unsupported: Dict[str, int]) -> str:
+    """把"不参与索引"的原因计数翻译成一句人话（供界面与 message 直接使用）。
+
+    与 CLI 共用 `converters.REASON_HINT`：同一种问题在命令行与面板里不应出现两种说法，
+    否则用户会以为是两回事。
+    """
+    if not unsupported:
+        return ""
+    return "；".join(f"{count} 个{REASON_HINT.get(reason, reason)}"
+                    for reason, count in sorted(unsupported.items()))
 
 
 def _rstrip_separators(text: str) -> str:
@@ -102,6 +115,16 @@ class CorpusStatus:
     n_files: int = 0
     total_bytes: int = 0
     files: List[str] = field(default_factory=list)
+    # ★ 索引相关**必须提前告知**的信息："文件数"不等于"会被索引的文件数"。
+    #   以前台账把 .pdf 数成"1 篇文档"、索引却是 0 块，用户只能靠猜哪里出了问题。
+    indexable: int = 0                                        # 真正会进入索引的文件数
+    degraded: int = 0                                         # 能索引但结构有损的数量
+    unsupported: Dict[str, int] = field(default_factory=dict)  # reason 码 → 数量
+
+    @property
+    def unsupported_text(self) -> str:
+        """把"不参与索引"的原因翻译成一句人话（供界面直接显示）。"""
+        return unsupported_text(self.unsupported)
 
     @property
     def usable(self) -> bool:
@@ -158,9 +181,46 @@ def check_corpus_dir(user_input: str, sample_limit: int = 5) -> CorpusStatus:
         return CorpusStatus(path=path, level="warn", n_files=0, total_bytes=0,
                             message=f"目录里没有受支持的文档（支持：{supported_suffixes_text()}）"
                                     f"；索引结果会是空——这可能是你想要的，也可能是路径填错了层级")
-    return CorpusStatus(path=path, level="ok", n_files=len(files), total_bytes=total,
-                        message=f"{len(files)} 个文件 / {total / 1024:.1f} KB",
-                        files=[str(Path(f).name) for f in files[:sample_limit]])
+
+    # ★ 关键统计：**哪些文件不会进索引**。必须在这里算出来——
+    #   用户真正关心的不是"目录里有多少文件"，而是"索引里会有多少内容"。
+    #   以前台账只报文件总数，于是"目录里 3 个 PDF、索引 0 块"完全无法解释。
+    unsupported: Dict[str, int] = {}
+    indexable = 0
+    degraded = 0
+    for item in files:
+        ok, reason = index_capability(item)
+        if not ok:
+            unsupported[reason] = unsupported.get(reason, 0) + 1
+            continue
+        indexable += 1
+        if reason == REASON_DEGRADED:
+            degraded += 1
+
+    # 显式逐字段构造而不是 `**base` 展开：`**dict[str, object]` 会让静态检查
+    # 完全失去对字段类型的判断（它无法证明 path 是 str 而不是 int），
+    # 报一堆 arg-type 却指不出真正的问题。多写几行换取"类型是真的被检查了"。
+    names = [str(Path(f).name) for f in files[:sample_limit]]
+
+    if indexable == 0:
+        # 目录里全是"扫描得到但索引不了"的文件（例如只有 PDF）。
+        # 这**必须报 warn**：报 ok 的话用户会以为一切正常，然后对着空索引反复排查路径。
+        return CorpusStatus(
+            path=path, level="warn", n_files=len(files), total_bytes=total,
+            files=names, indexable=0, degraded=0, unsupported=unsupported,
+            message=f"目录里有 {len(files)} 个文件，但**没有一个能进入索引**"
+                    f"——{unsupported_text(unsupported)}")
+
+    message = f"{len(files)} 个文件 / {total / 1024:.1f} KB（其中 {indexable} 个可索引）"
+    if degraded:
+        message += f"；{degraded} 个为降级索引（结构有损）"
+    if unsupported:
+        message += (f"；{len(files) - indexable} 个不参与索引"
+                    f"——{unsupported_text(unsupported)}")
+    return CorpusStatus(
+        path=path, level="ok", n_files=len(files), total_bytes=total,
+        files=names, indexable=indexable, degraded=degraded,
+        unsupported=unsupported, message=message)
 
 
 # ============================== 原生"选择文件夹"对话框 ==============================

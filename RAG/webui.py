@@ -54,6 +54,7 @@ except ImportError as error:                            # pragma: no cover - 依
 
 from RAG import config as C
 from RAG.chunkers import chunk_signature
+from RAG.converters import REASON_DEGRADED, REASON_HINT, index_capability
 from RAG.corpus import (
     DEFAULT_STATE,
     CorpusStatus,
@@ -150,6 +151,13 @@ class Session:
         self.last_index: Dict[str, Any] = {}
         # 语料目录的校验结论（由 get_session 填入，界面直接渲染）
         self.corpus_status: CorpusStatus = CorpusStatus()
+        # ---- 多轮追问（4A）----
+        # 历史挂在 Session 上而不是 st.session_state：Session 由 cache_resource 缓存，
+        # 与 pipeline 同生命周期，不会出现"pipeline 换了但历史还在"的错配。
+        self.turns: List[Dict[str, str]] = []
+        self.multi_turn: bool = False
+        # 去重用：面板每次交互都会整页重跑，没有它同一轮会被反复记录（见 record_turn）
+        self.recorded_question: str = ""
 
 
 # ============================== 装配（缓存） ==============================
@@ -228,12 +236,30 @@ def corpus_rows(session: Session) -> List[Dict[str, Any]]:
         children_by_name.setdefault(name, []).append(child)
     for path in files:
         name = Path(path).name
+        ok, reason = index_capability(path)
+        if not ok:
+            # ⛔ 这类文件**永远不会**被索引，所以绝不能显示成"需重建"——
+            #    那会让用户以为"等一等或点一下就 好了"，于是一直等下去。
+            #    台账的职责正是把这种"永远等不到结果"的状态说穿。
+            rows.append({
+                "文件": name,
+                "大小(KB)": round(Path(path).stat().st_size / 1024, 1),
+                "子块": 0,
+                "父块": 0,
+                "内容指纹": "-",
+                "库内状态": f"⛔ 不参与索引：{REASON_HINT.get(reason, reason)}",
+            })
+            continue
         fingerprint = file_fingerprint(path)
         stored = store.get_document_fingerprint(path)
         if stored == combine_fingerprint(fingerprint, signature):
             status = "✅ 已索引（内容与参数均未变）"
         else:
             status = "🔁 需重建：" + fingerprint_reason(stored, fingerprint, signature)
+        if reason == REASON_DEGRADED:
+            # 降级索引也要说清：内容搜得到，但结构（标题层级）有损，
+            # 否则用户会觉得"明明索引了，为什么溯源只能到文件名"
+            status += "（⚠ 降级：结构有损）"
         children = children_by_name.get(name, [])
         rows.append({
             "文件": name,
@@ -313,6 +339,19 @@ def tab_overview(session: Session, docs_dir: str) -> None:
                              f" / {len(pipeline.store.list_children())}")
     right.metric("上次索引", f"新建 {stat.get('parents', 0)} 父块 / 跳过 {stat.get('skipped', 0)}")
 
+    # ★ "文件数 ≠ 会被索引的文件数"。这一段存在的唯一理由：
+    #   没有它时，用户把 PDF 拖进语料目录后看到的是"语料文件 3 / 父块 0"，
+    #   要在"路径错了 / 程序坏了 / 格式不支持"之间猜。现在直接点名原因。
+    if status.unsupported:
+        st.warning(f"有 {status.n_files - status.indexable} 个文件**不会进入索引**："
+                   f"{status.unsupported_text}。这些文件不计入下面的父块/子块统计。")
+    if status.degraded:
+        st.info(f"有 {status.degraded} 个文件为**降级索引**：内容搜得到，但标题层级丢失、"
+                f"面包屑会退化为文件名。")
+    if stat.get("unsupported"):
+        st.caption(f"上次索引实际跳过了 {stat['unsupported']} 个文件："
+                   f"{'、'.join((stat.get('unsupported_files') or [])[:5])}")
+
     st.caption("组件装配（换任意一层都只改 main.py 的装配函数，编排层零改动）")
     st.dataframe(pd.DataFrame(component_rows(session)), hide_index=True, width="stretch")
 
@@ -334,8 +373,11 @@ def tab_overview(session: Session, docs_dir: str) -> None:
 
 def tab_retrieval(session: Session, question: str, top_k: int, min_sim: float) -> Dict:
     pipeline, recorder = session.pipeline, session.recorder
+    # 多轮模式：把历史交给 pipeline，由它统一负责"渲染历史 + 扣预算"。
+    # 关掉时传 None —— 这样 prompt 与单轮模式逐字一致，方便对照着看差异。
+    history = session.turns if session.multi_turn else None
     recorder.reset()
-    result = pipeline.query(question, top_k=top_k, min_sim=min_sim)
+    result = pipeline.query(question, top_k=top_k, min_sim=min_sim, history=history)
 
     st.subheader("① 流水线瀑布（每阶段的条数与耗时）")
     st.caption("条数下降的位置就是「淘汰」发生的地方：召回 → 融合 → 聚合 → 重排 → 装填。")
@@ -414,6 +456,24 @@ def tab_context(result: Dict) -> None:
     st.code(result.get("prompt") or "（无）", language="markdown")
 
 
+def record_turn(session: Session, question: str, answer_text: str) -> None:
+    """把这一轮问答记进多轮历史（仅在多轮模式开启时）。
+
+    ⚠ **必须按问题去重**：Streamlit 每次交互都会整页重跑，`tab_generation` 会被
+      再次调用；不去重的话同一轮会被记录几十次，历史预算瞬间被同一句话吃光——
+      表现为"明明只问了两句，为什么资料全被挤掉了"，而且完全看不出原因。
+      代价是"连着问两遍同一个问题"只记一次；对追问场景这个取舍可以接受。
+
+    只存**问题与答案正文**：prompt 和引用清单都很大，存进去会迅速吃光预算。
+    """
+    if not getattr(session, "multi_turn", False) or not question:
+        return
+    if question == session.recorded_question:
+        return
+    session.turns.append({"question": question, "answer": answer_text})
+    session.recorded_question = question
+
+
 def tab_generation(session: Session, result: Dict) -> None:
     pipeline = session.pipeline
     if pipeline.generator is None:
@@ -424,6 +484,8 @@ def tab_generation(session: Session, result: Dict) -> None:
         result["packed"], result.get("prompt") or "",
         question=result["query"],
         vec_score=result["vec_support"] if pipeline.support_gate else None)
+    # 记录这一轮（多轮模式开关由 record_turn 内部判断，并负责按问题去重）
+    record_turn(session, str(result.get("query") or ""), str(answer.get("text") or ""))
 
     st.subheader("① 答案")
     if answer.get("refused"):
@@ -712,13 +774,19 @@ def main() -> None:
         min_sim = st.slider("min_sim（余弦下限）", 0.0, 1.0,
                             float(state.get("min_sim", 0.0)), 0.05,
                             help="伪向量要传 0：它的分数普遍偏低，用 0.35 会把结果全滤掉")
+        multi_turn = st.checkbox(
+            "多轮追问（把历史拼进 prompt）",
+            value=bool(state.get("multi_turn", False)),
+            help="4A：只把历史拼进 prompt 并扣预算，**不做查询改写**——"
+                 "纯指代（如“它的默认值呢？”）仍会检索跑偏，请把问题问完整")
 
         # 开关变化也记住（否则每次开会话都要重设一遍）
-        if (use_bm25, use_mmr, with_generator, top_k, min_sim) != (
+        if (use_bm25, use_mmr, with_generator, top_k, min_sim, multi_turn) != (
                 state.get("use_bm25"), state.get("use_mmr"), state.get("with_generator"),
-                state.get("top_k"), state.get("min_sim")):
+                state.get("top_k"), state.get("min_sim"), state.get("multi_turn")):
             _persist(dict(state, use_bm25=use_bm25, use_mmr=use_mmr,
-                          with_generator=with_generator, top_k=top_k, min_sim=min_sim))
+                          with_generator=with_generator, top_k=top_k, min_sim=min_sim,
+                          multi_turn=multi_turn))
 
         st.divider()
         st.caption(f"索引签名 `{compute_index_signature(CachingEmbedder(HashEmbedder()))}`")
@@ -731,6 +799,21 @@ def main() -> None:
     question = st.text_input("问题", value=DEFAULT_QUESTION)
 
     session = get_session(docs_dir, use_bm25, use_mmr, with_generator)
+    # 多轮开关由界面传入（历史本身存在 Session 上，与 pipeline 同生命周期）
+    session.multi_turn = multi_turn
+    if multi_turn:
+        cols = st.columns([6, 1])
+        if session.turns:
+            cols[0].caption(
+                f"多轮历史：已记录 **{len(session.turns)}** 轮｜最近一轮："
+                f"「{session.turns[-1]['question'][:40]}」"
+                f"（历史会从资料预算里扣走，上限见 `config.HISTORY_MAX_TOKENS`）")
+        else:
+            cols[0].caption("多轮历史：还没有记录。提交一个问题后，这一轮会自动进入历史。")
+        if cols[1].button("清空历史", width="stretch"):
+            session.turns.clear()
+            session.recorded_question = ""
+            st.rerun()
 
     tabs = st.tabs(["① 总览", "② 检索瀑布", "③ 上下文与 prompt", "④ 生成与校验", "⑤ 评测"])
     with tabs[0]:

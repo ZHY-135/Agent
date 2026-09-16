@@ -13,8 +13,12 @@ from .logging_setup import get_logger
 
 logger = get_logger(__name__)
 
+# 必须与 converters.KIND_BY_SUFFIX **逐项保持一致**（两处不一致会导致
+# "扫描得到但转换不了"或"能转换但扫描不到"这类半边可用的问题）。
+# 注意其中的 `.pdf` / `.doc` 是"**登记但不支持**"：登记的目的是让它们被看见并给出
+# 可执行的提示，而不是被静默忽略（见 converters.convert_pdf / _doc_unsupported）。
 SUPPORTED = {".md", ".markdown", ".txt", ".html", ".htm",
-             ".pdf", ".docx"}          # 与 converters.KIND_BY_SUFFIX 保持一致
+             ".pdf", ".docx", ".doc"}
 
 
 def iter_documents(path: str) -> Iterator[str]:
@@ -63,11 +67,17 @@ def load_text(path: str) -> str:
 
 
 def _strip_html(html: str) -> str:
-    """极简 HTML 去标签（生产建议用 BeautifulSoup / html2text）。"""
-    import re
-    text = re.sub(r"<script.*?</script>|<style.*?</style>", "", html, flags=re.S | re.I)
-    text = re.sub(r"<[^>]+>", " ", text)
-    return re.sub(r"\s+\n\s+", "\n", text).strip()
+    """保留的兼容入口：委托给 `converters.strip_html_tags`（**单一真源**）。
+
+    为什么改成委托而不是各留一份实现：正则去标签一旦有两份就会各自演化——
+    本模块与 converters 曾经各有一版，行为已经不一致（一版保留段落边界、一版不保留，
+    而段落边界直接决定切分质量）。实现只保留在 `converters` 里。
+
+    依赖方向必须是 loaders → converters（`converters` 不反向依赖 `loaders`），
+    否则会形成循环导入——所以这里用函数内延迟导入，与 `load_converted` 的写法一致。
+    """
+    from .converters import strip_html_tags
+    return strip_html_tags(html)
 
 
 def load_all(path: str, seen: Optional[Dict[str, str]] = None) -> Iterator[Tuple[str, str, str]]:
@@ -92,18 +102,28 @@ class LoadedDoc:
         · 转换后为空          → markdown 为空，但**必须登记指纹**（否则每次索引都重读）
         · 依赖缺失/不可用      → available=False，应跳过且**不登记指纹**
     元组表达不了这个区别，最后会退化成"在调用方猜测"。
+
+    `reason` 与 `available` 并存的原因见 `converters.ConvertResult`：
+    "装个包就能好"与"怎么装都没用"对用户的行动指引相反，而 `available` 只能表达
+    "能不能用"。界面要靠 `reason` 分流提示，所以必须一路透传到调用方。
+
+    ⚠ 加了字段就必须**同步加进 `__slots__`**——漏掉会直接抛 AttributeError，
+    而且是在赋值那一刻才炸（不是定义处），排查起来容易绕远路。
     """
 
-    __slots__ = ("path", "markdown", "fingerprint", "label", "warnings", "available")
+    __slots__ = ("path", "markdown", "fingerprint", "label", "warnings",
+                 "available", "reason")
 
     def __init__(self, path: str, markdown: str, fingerprint: str, label: str,
-                 warnings: Optional[list] = None, available: bool = True):
+                 warnings: Optional[list] = None, available: bool = True,
+                 reason: str = ""):
         self.path = path
         self.markdown = markdown
         self.fingerprint = fingerprint
         self.label = label
         self.warnings = list(warnings or [])
         self.available = available
+        self.reason = reason
 
     @property
     def is_empty(self) -> bool:
@@ -139,6 +159,7 @@ def load_converted(path: str) -> Iterator["LoadedDoc"]:
             label=Path(p).stem,
             warnings=result.warnings,
             available=result.available,
+            reason=result.reason,
         )
 
 

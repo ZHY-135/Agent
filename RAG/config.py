@@ -17,6 +17,25 @@ EMBED_BATCH   = 64          # 批处理大小（实测 1000 块：逐条 21s →
 EMBED_RETRY   = 3           # 失败重试次数
 EMBED_BACKOFF = 0.5         # 指数退避基数（秒）
 
+# ---------- ②b 本机语义向量（RAG_EMBEDDING_PROVIDER=local）----------
+# 默认选中文小模型：本项目的主要语料是中文技术文档；bge-small-zh 只有 512 维、
+# 权重约 100 MB，是"能真的跑起来"与"效果可用"之间最划算的折中。
+DEFAULT_LOCAL_MODEL = "BAAI/bge-small-zh-v1.5"
+
+# 模型 → 向量维度。**必须与模型名一起生效**：
+# pgvector 建表时会把维度写进 DDL（vector(N)），也会写进每一行向量。
+# 维度对不上时错误会延迟到写库那一刻才爆，报的还是 SQL 层的类型错误——
+# 几乎不可能从那里反推出"其实是换了模型"。
+# ⚠ 换用表里没有的模型时**必须显式设置 RAG_EMBED_DIM**：
+#   我们会明确报错，而不是猜一个维度——猜错会静默写坏整个索引。
+#   （维度取自各模型官方说明；可用 `TextEmbedding.list_supported_models()` 查看 fastembed 支持的清单。）
+LOCAL_EMBED_MODELS = {
+    "BAAI/bge-small-zh-v1.5": 512,
+    "BAAI/bge-small-en-v1.5": 384,
+    "BAAI/bge-base-en-v1.5": 768,
+    "sentence-transformers/all-MiniLM-L6-v2": 384,
+}
+
 # ---------- ③ 存储 ----------
 HNSW_M              = 16    # 图连接数
 HNSW_EF_CONSTRUCTION= 64    # 建索引质量
@@ -28,6 +47,13 @@ CANDIDATE_MUL = 4           # 候选倍数：先取 top_k*4 再精排
 MIN_SIM       = 0.35        # 相似度阈值，低于此不返回
 BM25_WEIGHT   = 0.5         # 混合检索中关键词通道权重
 RRF_K         = 60          # RRF 融合常数（k 越小，排名靠前越占优）
+
+# ---------- ④b 多轮追问的历史预算 ----------
+# 历史对话是**从 CONTEXT_BUDGET 里扣走的固定支出**（见 context.pack_context 的
+# fixed 项）。给它一个独立上限的原因：不设上限时，聊得越久、留给资料的预算越少，
+# 最终退化成"模型只记得聊天、看不到文档"——而这**不会报错**，只是答案越来越差。
+# 1000 token 约合 3–5 轮中文问答，够消解"上面说的那个""它"这类指代。
+HISTORY_MAX_TOKENS = 1000
 
 # ---------- ④b 分数量纲标记（内部契约，不是可调参数）----------
 # 为什么需要它：本项目的分数有**三种互不可比的量纲**，而它们都是 "score"：

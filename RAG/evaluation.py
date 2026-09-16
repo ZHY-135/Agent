@@ -497,14 +497,25 @@ def _aggregate(items: List[GoldenItem], results: List[ItemResult],
 
 
 def evaluate_generation(*_args: Any, **_kwargs: Any) -> PolicyRates:
-    """生成侧指标（幻觉率 / 误拒率 / 拒答准确率）。**阶段 2 实现**。
+    """生成侧指标（幻觉率 / 误拒率 / 拒答准确率）。**尚未实现，且刻意不返回假数据**。
 
     现在不做的原因：它需要真实 LLM 调用，而检索指标可以完全离线复现。
-    两者混在一次运行里，会导致「跑一次消融要花钱」，回归门禁就没人跑了。
+    两者混在一次运行里会变成"跑一次消融要花钱"，回归门禁就没人跑了。
+
+    ★ 为什么**抛错**而不是返回一份全 0 的 `PolicyRates`：
+      全 0 会被调用方（以及报告渲染）当成"幻觉率 0%、拒答准确率 0%"这种**看起来是结果**的数字，
+      而真相是"根本没测"。宁可让调用点当场失败，也不要产出会被写进报告的假指标。
+
+    ⚠ 这是一个**预留入口，目前没有任何 CLI 参数会调到它**（`main.py` 的 `eval` 只跑检索侧）。
+      早先这里的提示让人"改用 `--mode retrieval`"——那个参数从来不存在，
+      属于把排查方向直接带偏的一类错误信息，已改正。
+      真要实现时的最小范围：需要 `--provider openai`，并为评测集补充"应有答案/应拒答"的标注。
     """
     raise NotImplementedError(
-        "生成侧指标属于阶段 2：需要 --provider openai（真实 LLM 调用）。"
-        "当前阶段请用 --mode retrieval 评测检索质量。")
+        "生成侧指标（幻觉率 / 误拒率 / 拒答准确率）尚未实现：它需要真实 LLM 调用，"
+        "而检索侧指标是完全离线可复现的，两者混跑会让回归门禁产生费用。\n"
+        "    当前 `eval` 子命令只评测检索质量；生成侧指标见 "
+        "docs/项目后续改进方案.md 的 F2 与第十九章。")
 
 
 def evaluate(items: Sequence[GoldenItem], results: Sequence[ItemResult],

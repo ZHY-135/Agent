@@ -22,16 +22,19 @@ LLM 看到的是 5 段被腰斩的资料——**每段都读不通**。
 --------------------------------------------------------------------------------
 Reader's guide
 --------------------------------------------------------------------------------
-    estimate_tokens()  —— token 数粗估（本模块所有预算计算的基础）
+    estimate_tokens()   —— token 数粗估（本模块所有预算计算的基础）
     pack_context()     —— 核心：按预算把命中装填成 blocks，产出引用编号
     render_prompt()    —— 把装填结果渲染成最终发给 LLM 的字符串
+    format_history()   —— 把多轮历史渲染成 prompt 里的一段（**不带 [n] 编号**）
+    trim_history()     —— 按"保留最近若干轮"裁剪历史，并给出它该占的预算
 """
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .config import (
     ANSWER_SYSTEM_PROMPT,
     CHARS_PER_TOKEN,
     CONTEXT_BUDGET,
+    HISTORY_MAX_TOKENS,
     SCORE_KIND_KEY,
     USE_CITATION_CONSTRAINT,
 )
@@ -140,16 +143,79 @@ def pack_context(hits: List[Dict], parents: Dict[str, Dict],
     }
 
 
+# ============================== 多轮历史（4A）==============================
+
+# 历史段的标题刻意写得很长：它同时承担"告诉模型这是什么"和"约束模型别引用它"两件事。
+# 为什么不改 ANSWER_SYSTEM_PROMPT 来加约束：那个常量被所有调用共享，
+# 改它会让**没有历史**的请求的 prompt 也发生变化——而 render_prompt 的默认输出
+# 已被 stress_test 等外部调用逐字依赖，不能漂移。
+HISTORY_SECTION_TITLE = (
+    "===== 历史对话（仅供理解指代，**不是资料**，不得作为引用来源）=====")
+
+
+def format_history(history: Optional[Sequence[Dict]]) -> str:
+    """把多轮历史渲染成 prompt 里的一段文本；空历史返回空串。
+
+    ★ **绝对不用 `[n]` 编号**（这是本模块最容易埋坑的地方）：
+      `generators` 会把答案里的 `[n]` 拿去和 `packed["blocks"]` 的 ref 比对做引用校验。
+      历史若也用 `[1][2]`，模型照着写就会被解析成"指向资料块"——于是
+      要么给出一条**错误溯源**的引用，要么触发 `invalid_citation` 误判。
+      所以历史用"用户/助手"标记，并把"不是资料"写进段标题里。
+
+    与 `estimate_history_tokens` **共用本函数**：预算预留的文本与实际渲染的文本
+    必须是同一个来源，否则两者会漂移（预留少了 → 上下文超限，API 直接报错）。
+    """
+    if not history:
+        return ""
+    lines: List[str] = []
+    for turn in history:
+        question = str(turn.get("question") or turn.get("q") or "").strip()
+        answer = str(turn.get("answer") or turn.get("a") or "").strip()
+        if question:
+            lines.append(f"用户：{question}")
+        if answer:
+            lines.append(f"助手：{answer}")
+    return "\n".join(lines)
+
+
+def estimate_history_tokens(history: Optional[Sequence[Dict]]) -> int:
+    """历史占用的 token 估算（与渲染共用 `format_history`，见其说明）。"""
+    text = format_history(history)
+    return estimate_tokens(text) if text else 0
+
+
+def trim_history(history: Optional[Sequence[Dict]],
+                 max_tokens: int = HISTORY_MAX_TOKENS) -> Tuple[List[Dict], int]:
+    """裁剪历史，返回 `(保留的轮次, 它们的 token 估算)`。
+
+    保留策略是**从最近一轮往前留**：多轮追问里最新的上下文才是用户当前的话题，
+    砍掉最早的比砍掉最新的合理（这也是各家 prompt 裁剪的通行做法）。
+
+    为什么必须裁剪而不是全带上：历史是从 `CONTEXT_BUDGET` 里**扣走**的固定支出。
+    不裁剪的话，聊得越久留给资料的预算越少，最后退化成"模型只记得聊天、看不到文档"——
+    这个过程**不会报错**，只会让答案越来越差，属于最难察觉的一类退化。
+    """
+    kept: List[Dict] = []
+    for turn in reversed(list(history or [])):
+        candidate = [turn] + kept
+        if estimate_history_tokens(candidate) > max_tokens:
+            break                                       # 再加一轮就超预算：停止
+        kept = candidate
+    return kept, estimate_history_tokens(kept)
+
+
 def render_prompt(packed: Dict, query: str, system: Optional[str] = None,
-                  strict: bool = False) -> str:
+                  strict: bool = False,
+                  history: Optional[Sequence[Dict]] = None) -> str:
     """把装填结果渲染成最终 prompt。
 
-    输出结构固定为三段：系统提示词 → 参考资料 → 问题。
+    输出结构：系统提示词 →（可选）历史对话 → 参考资料 → 问题。
     为什么资料段要用 `[n] 来源：路径/标题` 开头：这样每一块都自带出处，
     LLM 被要求"标注引用"时才知道该写哪个编号，人工核查时也能直接定位文件。
 
-    system / strict 的默认值刻意保持「与加入生成层之前完全一致」——
-    render_prompt 已被 stress_test 等外部调用依赖，默认行为不能漂移。
+    system / strict / history 的默认值刻意保持「与加入这些特性之前完全一致」——
+    render_prompt 已被 stress_test 等外部调用依赖，默认行为不能漂移：
+    `history=None` 时输出与旧版本**逐字相同**（已由测试钉住）。
     strict=True 时才注入 config.ANSWER_SYSTEM_PROMPT（含强制 [n] 引用约束），
     供 pipeline.answer() 使用。
     """
@@ -169,4 +235,11 @@ def render_prompt(packed: Dict, query: str, system: Optional[str] = None,
             f"[{b['ref']}] 来源：{b.get('source')}"
             f"{(' / ' + b['heading']) if b.get('heading') else ''}\n{b['text']}"
             for b in packed["blocks"])
-    return f"{system}\n\n===== 参考资料 =====\n{context}\n\n===== 问题 =====\n{query}"
+
+    sections = [system]
+    history_text = format_history(history)
+    if history_text:                                    # 无历史时不插入任何空段
+        sections.append(f"{HISTORY_SECTION_TITLE}\n{history_text}")
+    sections.append(f"===== 参考资料 =====\n{context}")
+    sections.append(f"===== 问题 =====\n{query}")
+    return "\n\n".join(sections)

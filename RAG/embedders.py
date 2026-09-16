@@ -26,7 +26,8 @@
 --------------------------------------------------------------------------------
     Embedder          接口：只要实现 embed_batch(texts) -> List[向量] 就能接入
       ├─ HashEmbedder     离线伪向量（零依赖，用于跑通链路与测试）
-      └─ OpenAIEmbedder   生产实现（真实语义向量）
+      ├─ LocalEmbedder    本机真实语义向量（fastembed/ONNX，**无需 API Key**）
+      └─ OpenAIEmbedder   生产实现（真实语义向量，需 API Key）
     CachingEmbedder   装饰器：包在任意 Embedder 外面，加一层内容缓存
     embed_all()       编排函数：把上面的东西按"批次 + 重试 + 校验"跑完
 
@@ -170,6 +171,100 @@ class OpenAIEmbedder(Embedder):
         resp = self.client.embeddings.create(model=self.model, input=list(texts))
         # 按输入顺序取回向量：服务端的返回顺序与输入一致，这是 API 契约的一部分
         return [d.embedding for d in resp.data]
+
+
+def _load_fastembed() -> Optional[type]:
+    """返回 fastembed 的 `TextEmbedding` 类；未安装返回 None。
+
+    与 `converters._load_bs4` / `_load_docx` 同一个套路，理由也相同：
+    测试需要一个**确定性的**"没装 fastembed"环境。把 import 写在函数体内部的话，
+    那条分支只能靠卸载依赖来覆盖——而在装了它的开发机上，它将永远测不到，
+    而"缺依赖时的提示"恰恰是用户第一次接触这个功能时最可能看到的画面。
+    """
+    try:
+        from fastembed import TextEmbedding
+    except ImportError:
+        return None
+    return TextEmbedding
+
+
+class LocalEmbedder(Embedder):
+    """本机运行的真实语义向量（fastembed / ONNX Runtime，**无需 API Key**）。
+
+    ★ 为什么需要它：默认的 `HashEmbedder` 只认字面重合，于是 clone 下来的人第一印象
+      就是"检索很差"（伪向量的 recall@5 只有 0.25）；而真实语义检索以前只有 openai
+      一条路，意味着**必须自备 API Key**——仅这一条就挡掉了绝大多数想试一下的人。
+
+    ★ `pseudo_vectors` **必须是 False**（不能沿用 `HashEmbedder` 的 True）：
+      `pipeline.support_gate = not pseudo_vectors`。若标成 True，支持度门禁与
+      `REFUSE_MIN_VEC_SCORE`（config.py）会一起失效，三层防幻觉里的
+      "生成前拒答"就形同虚设——而界面上一切正常，这正是最难发现的一类退化。
+      同理，`CachingEmbedder` 必须透传这个属性（见该类的 `pseudo_vectors`）。
+    """
+
+    pseudo_vectors = False
+
+    def __init__(self, model_name: str, dim: int, cache_dir: Optional[str] = None):
+        self.model_name = model_name
+        self._dim = dim
+        self._cache_dir = cache_dir
+        self._model = None            # 懒加载：构造时不触发下载（见 _ensure_model）
+
+    def _ensure_model(self):
+        """首次调用时才加载模型（会联网下载权重）。
+
+        ★ 为什么必须懒加载：`build_embedder()` 在很多命令里都会被调用，但只有真正
+          要 embed 时才需要模型。若在构造时就加载，`rag --help` / `rag init-db`
+          这类命令也会被迫下载几十上百 MB——用户只会看到命令卡住，不知道该等还是该退。
+        """
+        if self._model is not None:
+            return self._model
+        embedding_class = _load_fastembed()
+        if embedding_class is None:
+            raise RuntimeError(
+                "使用本地嵌入需要 fastembed：pip install \"rag-min[local]\"\n"
+                "    离线环境可继续用默认的零依赖伪向量（不设 RAG_EMBEDDING_PROVIDER 即可）")
+        try:
+            self._model = embedding_class(model_name=self.model_name,
+                                          cache_dir=self._cache_dir)
+        except Exception as error:                     # noqa: BLE001
+            raise RuntimeError(
+                f"加载本地模型 {self.model_name} 失败（首次使用需要联网下载权重）：{error}\n"
+                f"    可指定的本地模型见 config.LOCAL_EMBED_MODELS；"
+                f"离线环境请改用默认伪向量") from error
+        return self._model
+
+    @property
+    def dim(self):
+        return self._dim
+
+    @property
+    def identity(self):
+        """必须带上**模型名**：本模块顶部已说明"维度相同但模型不同"是最危险的组合。
+
+        只比较维度的话，从 bge-small-en（384）换到 all-MiniLM-L6-v2（也是 384）
+        会被判定为"没换"，于是旧向量继续参与比较——两个不同向量空间的向量算余弦，
+        结果没有任何意义，但程序不会报任何错。
+        """
+        return f"LocalEmbedder:{self.model_name}:{self._dim}"
+
+    def embed_batch(self, texts):
+        # 与 OpenAIEmbedder 同一约定：空输入在这里就拦住，报错位置更靠近调用者，
+        # 而不是等 fastembed 内部抛出难懂的错误
+        if not texts or any(not text.strip() for text in texts):
+            raise ValueError("embedding 输入不能为空")
+        model = self._ensure_model()
+        vectors = [list(vector) for vector in model.embed(list(texts))]
+        # 维度自检：这里能给出**针对本地模型**的修复指引（embed_all 的通用检查
+        # 只会说"维度不匹配"，不会告诉用户该设成多少）
+        if vectors and len(vectors[0]) != self._dim:
+            actual = len(vectors[0])
+            raise ValueError(
+                f"本地模型 {self.model_name} 实际输出 {actual} 维，"
+                f"但当前配置声明 {self._dim} 维。\n"
+                f"    请设置 RAG_EMBED_DIM={actual}（pgvector 建表时也会用到它）；"
+                f"若库里已有旧向量，需要重新索引")
+        return vectors
 
 
 class CachingEmbedder(Embedder):

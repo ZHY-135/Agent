@@ -43,11 +43,11 @@
 import hashlib
 import os
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from . import config as C
 from .chunkers import build_parent_child, chunk_signature
-from .context import pack_context, render_prompt
+from .context import pack_context, render_prompt, trim_history
 from .embedders import Embedder, embed_all
 from .generators import Generator, support_score
 from .loaders import load_converted
@@ -118,6 +118,22 @@ def fingerprint_reason(stored: Optional[str], file_hash: str, signature: str) ->
     return "文件内容未变，但索引签名已变化（改动的是切分参数或嵌入模型）"
 
 
+def resolve_history(history: Optional[List[Dict]],
+                    explicit_tokens: int = 0) -> Tuple[List[Dict], int]:
+    """把"历史内容"与"历史预算"收敛到一处，返回 `(保留的轮次, 该占的 token)`。
+
+    ★ 为什么必须收敛：预算与实际渲染出的文本**必须一致**。若让调用方同时给出
+      内容与数字，两者迟早会不一致——
+        · 预留少了 → prompt 实际长度超出窗口，API 直接报错；
+        · 预留多了 → 白占本该留给资料的预算，检索到的内容反而装不进去。
+      所以**给内容就够，数字由这里算**；只有在没给内容时才沿用旧的数字接口
+      （`history_tokens` 仍是公开参数，stress_test 依赖它做预算封顶验证）。
+    """
+    if not history:
+        return [], explicit_tokens
+    return trim_history(history)
+
+
 class RAGPipeline:
     """所有依赖从构造参数注入，因此换任意一层都不需要改本文件的代码。
 
@@ -172,6 +188,13 @@ class RAGPipeline:
         `empty` 是「切不出任何子块」的文件数（空文件、纯符号、超短文件）。
         这类文件也会登记指纹——否则每次 index() 都要重新读取与切分它们。
 
+        另外还回传两组"负面结果"，它们同样重要：
+        · `unsupported` / `unsupported_reasons` / `unsupported_files`：
+          **扫描到了但没能进索引**的文件（PDF、`.doc`、缺 python-docx 的 `.docx`），按原因码分组。
+          必须报出来，否则"我把文件放进目录了却什么都没发生"无法解释。
+        · `degraded` / `degraded_files`：**进了索引但结构有损**的文件（如 HTML 缺 bs4）。
+          内容搜得到，但面包屑质量下降，应当如实告知而不是假装无事。
+
         注意这里"每个文件独立处理"的设计：
         每个文件都单独完成"切分 → 嵌入 → 写入"，而不是先全部切分再统一嵌入。
         好处是单文件粒度的事务边界清晰（store.replace_document 一个文件一次），
@@ -182,6 +205,13 @@ class RAGPipeline:
         # 后面据此判断"哪些已索引文件在磁盘上消失了"。
         root = os.path.abspath(path)
         sources = set()                                   # 本轮在磁盘上实际看到的文件
+        # ★ 被跳过的文件必须**被统计出来**，否则"我放了文件却没反应"永远无法解释。
+        #   以前这些文件只留一行日志：语料台账把 .pdf 数成"1 篇文档"，索引却是 0 块，
+        #   用户在界面上看不到任何线索。
+        #   按原因分组（reason → 文件名），界面与 CLI 才能给出**不同**的行动指引：
+        #   "装个包就能好"和"当前版本不支持"是完全不同的两件事。
+        unsupported: Dict[str, List[str]] = {}
+        degraded: List[str] = []                          # 索引了，但结构有损（如 HTML 缺 bs4）
         # 把签名打进索引日志：出问题时第一眼就能确认"这次索引用的是哪套参数/哪个模型"。
         logger.debug("索引签名=%s（切分参数 %s + 嵌入模型 %s）",
                      self.index_signature, chunk_signature(),
@@ -194,9 +224,13 @@ class RAGPipeline:
             if not doc.available:
                 for message in doc.warnings:
                     logger.warning("%s", message)
+                unsupported.setdefault(doc.reason or "unknown", []).append(
+                    os.path.basename(src))
                 continue
             for message in doc.warnings:
                 logger.info("%s", message)                 # 转换为空 / 未识别标题等提示
+            if doc.reason:                                 # 可用但降级：内容进索引，结构有损
+                degraded.append(os.path.basename(src))
             # ★ 增量索引的核心：指纹 = 内容哈希 + 索引签名，两者都没变才整篇跳过。
             #   这一步省掉的是**真金白银**——跳过意味着不转换、不切分、不重新 embedding。
             #   用内容哈希而不是修改时间：复制/checkout 会改时间但内容没变。
@@ -245,10 +279,18 @@ class RAGPipeline:
                     deleted += 1
                     logger.info("清理已删除文件的索引：%s", source)
         self._rebuild_bm25()
-        logger.debug("索引完成：父块 %d，子块 %d，跳过 %d，删除 %d，空文件 %d",
-                     n_parent, n_child, skipped, deleted, empty)
+        unsupported_files = [name for names in unsupported.values() for name in names]
+        logger.debug("索引完成：父块 %d，子块 %d，跳过 %d，删除 %d，空文件 %d，未索引 %d，降级 %d",
+                     n_parent, n_child, skipped, deleted, empty,
+                     len(unsupported_files), len(degraded))
         return {"parents": n_parent, "children": n_child,
                 "skipped": skipped, "deleted": deleted, "empty": empty,
+                # 摘要与明细都给：摘要用于一行结论，明细用于回答"到底是哪个文件、为什么"。
+                "unsupported": len(unsupported_files),
+                "unsupported_reasons": {k: len(v) for k, v in unsupported.items()},
+                "unsupported_files": unsupported_files,
+                "degraded": len(degraded),
+                "degraded_files": degraded,
                 # 一并回传签名：可视化面板要显示"本次索引用的是哪套参数/模型"，
                 # 并据此判断"磁盘文件数 == 库内文件数"是否成立。
                 "signature": self.index_signature}
@@ -388,23 +430,31 @@ class RAGPipeline:
         }
 
     def query(self, query: str, top_k: int = C.TOP_K,
-              history_tokens: int = 0, min_sim: Optional[float] = None) -> Dict:
+              history_tokens: int = 0, min_sim: Optional[float] = None,
+              history: Optional[List[Dict]] = None) -> Dict:
         """检索 + 渲染 prompt。不调用 LLM，行为与加入生成层之前保持一致。
 
         用于两类场景：
             · 调用方想自己接管生成（用别的模型、别的框架）；
             · 评测检索指标（**不花钱、完全可复现**，因此适合当回归门禁）。
+
+        `history` 是多轮历史（`[{"question": …, "answer": …}, …]`）。
+        ⚠ 本轮（4A）**只做"拼历史 + 扣预算"，不做查询改写**：追问里的代词
+        （"它呢？"）不会被展开成独立查询，所以检索仍可能跑偏。
+        见 `answer()` 的说明与 README 的"已知限制"。
         """
+        kept, tokens = resolve_history(history, history_tokens)
         result = self.retrieve(query, top_k=top_k,
-                               history_tokens=history_tokens, min_sim=min_sim)
+                               history_tokens=tokens, min_sim=min_sim)
         # strict 保持默认 False：这样 query() 的 prompt 与历史版本逐字一致，
         # 依赖它的 stress_test 等外部调用不会因为生成层的加入而行为漂移
-        result["prompt"] = render_prompt(result["packed"], query)
+        result["prompt"] = render_prompt(result["packed"], query, history=kept)
         return result
 
     def answer(self, query: str, top_k: int = C.TOP_K,
                history_tokens: int = 0, min_sim: Optional[float] = None,
-               strict_citations: bool = C.USE_CITATION_CONSTRAINT) -> Dict:
+               strict_citations: bool = C.USE_CITATION_CONSTRAINT,
+               history: Optional[List[Dict]] = None) -> Dict:
         """检索 + 生成 + 引用回填校验 + 拒答。
 
         比 query() 多做四件事：
@@ -412,6 +462,15 @@ class RAGPipeline:
             2. 生成前拒答门禁（无资料 / 向量支持度不足 → 不调用 LLM）；
             3. 生成后引用回填校验（凭空编号、无据结论可被检出）；
             4. 把引用编号解析成可溯源的出处清单。
+
+        `history` 是多轮历史（`[{"question": …, "answer": …}, …]`）。
+
+        ⚠ **本轮（4A）的能力边界，必须如实理解**：
+          只把历史拼进 prompt 并把预算扣掉，**没有查询改写**。所以
+            · 能用的：追问里出现上一轮的原词时，模型可借助历史理解上下文；
+            · **不能用的**：纯指代（"它的默认值呢？"）仍会**检索跑偏**——
+              因为检索用的是原始问句，而原始问句里没有可检索的实词。
+          真正的解法是先用一次 LLM 调用把追问改写成独立查询（4B，已列入改进方案）。
 
         注意 2、3、4 都不在这个方法里实现，而是封装在 generator.answer() 里。
         这样做的好处：换 LLM 供应商（OpenAI → 别的）时，拒答策略与引用校验
@@ -431,13 +490,15 @@ class RAGPipeline:
             raise ValueError("未注入 generator：构造 RAGPipeline(generator=...) "
                              "或改用 query() 只取 prompt")
 
+        kept, tokens = resolve_history(history, history_tokens)
         result = self.retrieve(query, top_k=top_k,
-                               history_tokens=history_tokens, min_sim=min_sim)
+                               history_tokens=tokens, min_sim=min_sim)
 
         # strict=True：注入 config.ANSWER_SYSTEM_PROMPT，里面明确要求
         # "只依据参考资料作答"与"每个事实性陈述标注 [n]"。
         # 这是三层防幻觉防线里的第二层（生成中约束）。
-        prompt = render_prompt(result["packed"], query, strict=strict_citations)
+        prompt = render_prompt(result["packed"], query, strict=strict_citations,
+                               history=kept)
         # support_gate=False 时传 None：Generator 会跳过 weak_support 判定，
         # 但「无资料」门禁与生成后的引用校验照常生效。
         answer = self.generator.answer(
